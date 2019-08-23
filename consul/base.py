@@ -471,7 +471,7 @@ class Consul(object):
                 self,
                 name=None,
                 index=None,
-                wait=None
+                wait=None,
                 token=None):
             """
             Returns a tuple of (*index*, *events*)
