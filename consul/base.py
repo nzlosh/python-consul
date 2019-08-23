@@ -471,7 +471,8 @@ class Consul(object):
                 self,
                 name=None,
                 index=None,
-                wait=None):
+                wait=None
+                token=None):
             """
             Returns a tuple of (*index*, *events*)
                 Note: Since Consul's event protocol uses gossip, there is no
@@ -514,6 +515,9 @@ class Consul(object):
                 params.append(('index', index))
                 if wait:
                     params.append(('wait', wait))
+            token = token or self.agent.token
+            if token:
+                params.append(('token', token))
             return self.agent.http.get(
                 CB.json(index=True, decode='Payload'),
                 '/v1/event/list', params=params)
