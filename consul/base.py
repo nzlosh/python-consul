@@ -13,6 +13,17 @@ from six.moves import urllib
 log = logging.getLogger(__name__)
 
 
+def args_to_payload(args_map):
+    return [
+        (key, value)
+        for key, value in
+        {
+            k: v for
+            k, v in args_map.items() if v is not None and k != "self"
+        }.items()
+    ]
+
+
 class ConsulException(Exception):
     pass
 
@@ -246,14 +257,11 @@ class CB(object):
 
 
 class HTTPClient(six.with_metaclass(abc.ABCMeta, object)):
-    def __init__(self, host='127.0.0.1', port=8500, scheme='http',
-                 verify=True, cert=None):
-        self.host = host
-        self.port = port
-        self.scheme = scheme
+    def __init__(self, base_uri, verify=True, cert=None, auth=None):
+        self.base_uri = base_uri
         self.verify = verify
-        self.base_uri = '%s://%s:%s' % (self.scheme, self.host, self.port)
         self.cert = cert
+        self.auth = auth
 
     def uri(self, path, params=None):
         uri = self.base_uri + urllib.parse.quote(path, safe='/:')
@@ -288,7 +296,9 @@ class Consul(object):
             consistency='default',
             dc=None,
             verify=True,
-            cert=None):
+            cert=None,
+            auth=None,
+            addr=None):
         """
         *token* is an optional `ACL token`_. If supplied it will be used by
         default for all requests made with this client session. It's still
@@ -305,27 +315,19 @@ class Consul(object):
 
         *verify* is whether to verify the SSL certificate for HTTPS requests
 
-        *cert* client side certificates for HTTPS requests
+        *cert* tuple containing client certificate and key for HTTPS requests
+
+        *addr* url to use instead of host, port and scheme.
+            e.g. unix:///var/run/consul/http.sock, http://localhost:8500/
         """
 
         # TODO: Status
 
-        if os.getenv('CONSUL_HTTP_ADDR'):
-            try:
-                host, port = os.getenv('CONSUL_HTTP_ADDR').split(':')
-            except ValueError:
-                raise ConsulException('CONSUL_HTTP_ADDR (%s) invalid, '
-                                      'does not match <host>:<port>'
-                                      % os.getenv('CONSUL_HTTP_ADDR'))
-        use_ssl = os.getenv('CONSUL_HTTP_SSL')
-        if use_ssl is not None:
-            scheme = 'https' if use_ssl == 'true' else 'http'
-        if os.getenv('CONSUL_HTTP_SSL_VERIFY') is not None:
-            verify = os.getenv('CONSUL_HTTP_SSL_VERIFY') == 'true'
+        if not addr:
+            addr = '{0}://{1}:{2}'.format(scheme, host, port)
 
-        self.http = self.connect(host, port, scheme, verify, cert)
-        self.token = os.getenv('CONSUL_HTTP_TOKEN', token)
-        self.scheme = scheme
+        self.http = self.connect(addr, verify=verify, cert=cert, auth=auth)
+        self.token = token
         self.dc = dc
         assert consistency in ('default', 'consistent', 'stale'), \
             'consistency must be either default, consistent or state'
@@ -344,6 +346,62 @@ class Consul(object):
         self.coordinate = Consul.Coordinate(self)
         self.operator = Consul.Operator(self)
 
+    @classmethod
+    def from_env(cls, consistency='default', dc=None):
+        """
+        Return a client configured from environment variables.
+        The environment variables used are the same as those used by the
+        consul command-line client. Refer to the consul documentation [1] for
+        a list of existing environment variables.
+
+        Additionally all supported given keyword arguments are passed on the
+        client constructor.
+
+        [1] https://www.consul.io/docs/commands/index.html#environment-variables # noqa: E501
+        """
+        oe = os.environ
+        kwargs = {
+            'consistency': consistency,
+            'dc': dc,
+            'token': oe.get('CONSUL_HTTP_TOKEN', None),
+        }
+
+        addr = oe.get('CONSUL_HTTP_ADDR', None)
+        if addr:
+            if not addr.startswith('http'):
+                # Ensure addr starts with a scheme.
+                ssl = oe.get('CONSUL_HTTP_SSL', False)
+                if ssl == 'false':
+                    ssl = False
+                elif ssl == 'true':
+                    ssl = True
+
+                if ssl:
+                    scheme = 'https'
+                else:
+                    scheme = 'http'
+                addr = '%s://%s' % (scheme, addr)
+            kwargs['addr'] = addr
+
+        verify = oe.get('CONSUL_CACERT',
+                        oe.get('CONSUL_HTTP_SSL_VERIFY', None))
+        if verify:
+            if verify == 'false':
+                verify = False
+            elif verify == 'true':
+                verify = True
+            kwargs['verify'] = verify
+
+        if 'CONSUL_CLIENT_CERT' in oe \
+                and 'CONSUL_CLIENT_KEY' in oe:
+            kwargs['cert'] = (oe['CONSUL_CLIENT_CERT'],
+                              oe['CONSUL_CLIENT_KEY'])
+
+        if 'CONSUL_HTTP_AUTH' in oe:
+            kwargs['auth'] = oe['CONSUL_HTTP_AUTH'].split(':')
+
+        return cls(**kwargs)
+
     class Event(object):
         """
         The event command provides a mechanism to fire a custom user event to
@@ -358,6 +416,7 @@ class Consul(object):
         practice, this means you cannot rely on the order of message delivery.
         An advantage however is that events can still be used even in the
         absence of server nodes or during an outage."""
+
         def __init__(self, agent):
             self.agent = agent
 
@@ -412,7 +471,8 @@ class Consul(object):
                 self,
                 name=None,
                 index=None,
-                wait=None):
+                wait=None,
+                token=None):
             """
             Returns a tuple of (*index*, *events*)
                 Note: Since Consul's event protocol uses gossip, there is no
@@ -455,6 +515,9 @@ class Consul(object):
                 params.append(('index', index))
                 if wait:
                     params.append(('wait', wait))
+            token = token or self.agent.token
+            if token:
+                params.append(('token', token))
             return self.agent.http.get(
                 CB.json(index=True, decode='Payload'),
                 '/v1/event/list', params=params)
@@ -465,6 +528,7 @@ class Consul(object):
         used to store service configurations or other meta data in a simple
         way.
         """
+
         def __init__(self, agent):
             self.agent = agent
 
@@ -510,7 +574,7 @@ class Consul(object):
                     "LockIndex": 200,
                     "Key": "foo",
                     "Flags": 0,
-                    "Value": "bar",
+                    "Value": b"bar",
                     "Session": "adf4238a-882b-9ddc-4a9d-5b6758e4159e"
                 }
 
@@ -662,6 +726,7 @@ class Consul(object):
         The Transactions endpoints manage updates or fetches of multiple keys
         inside a single, atomic transaction.
         """
+
         def __init__(self, agent):
             self.agent = agent
 
@@ -680,7 +745,7 @@ class Consul(object):
                     "KV": {
                       "Verb": "<verb>",
                       "Key": "<key>",
-                      "Value": "<Base64-encoded blob of data>",
+                      "Value": b"<Base64-encoded blob of data>",
                       "Flags": 0,
                       "Index": 0,
                       "Session": "<session id>"
@@ -697,6 +762,7 @@ class Consul(object):
         takes on the burden of registering with the Catalog and performing
         anti-entropy to recover from outages.
         """
+
         def __init__(self, agent):
             self.agent = agent
             self.service = Consul.Agent.Service(agent)
@@ -806,6 +872,33 @@ class Consul(object):
             return self.agent.http.put(
                 CB.bool(), '/v1/agent/force-leave/%s' % node)
 
+        def leave(self, node):
+            """
+            This endpoint instructs the agent to graceful leave a node.
+            It is used to ensure other nodes see the agent as "left"
+            instead of "failed". Nodes that leave will not attempt to
+            re-join the cluster on restarting with a snapshot. For nodes
+            in server mode, the node is removed from the Raft peer
+            set in a graceful manner. This is critical, as in certain
+            situations a non-graceful leave can affect cluster availability.
+            *node* is the node to change state for.
+            """
+
+            return self.agent.http.put(
+                CB.bool(), '/v1/agent/leave/%s' % node)
+
+        def metrics(self, token=None):
+            """
+            Returns dump of the metrics for the most recent finished interval
+            """
+            params = []
+            token = token or self.agent.token
+            if token:
+                params.append(('token', token))
+            return self.agent.http.get(
+                CB.json(), '/v1/agent/metrics',
+                params=params)
+
         class Service(object):
             def __init__(self, agent):
                 self.agent = agent
@@ -901,14 +994,21 @@ class Consul(object):
                     params=params,
                     data=json.dumps(payload))
 
-            def deregister(self, service_id):
+            def deregister(self, service_id, token=None):
                 """
                 Used to remove a service from the local agent. The agent will
                 take care of deregistering the service with the Catalog. If
                 there is an associated check, that is also deregistered.
                 """
+                params = []
+                token = token or self.agent.token
+                if token:
+                    params.append(("token", token))
                 return self.agent.http.put(
-                    CB.bool(), '/v1/agent/service/deregister/%s' % service_id)
+                    CB.bool(),
+                    '/v1/agent/service/deregister/%s' % service_id,
+                    params
+                )
 
             def maintenance(self, service_id, enable, reason=None):
                 """
@@ -1152,6 +1252,7 @@ class Consul(object):
                 data['WriteRequest'] = {'Token': token}
                 params.append(('token', token))
             if node_meta:
+                data['nodemeta'] = node_meta
                 for nodemeta_name, nodemeta_value in node_meta.items():
                     params.append(('node-meta', '{0}:{1}'.
                                    format(nodemeta_name, nodemeta_value)))
@@ -1185,6 +1286,7 @@ class Consul(object):
             assert not (service_id and check_id)
             data = {'node': node}
             dc = dc or self.agent.dc
+            params = []
             if dc:
                 data['datacenter'] = dc
             if service_id:
@@ -1194,8 +1296,13 @@ class Consul(object):
             token = token or self.agent.token
             if token:
                 data['WriteRequest'] = {'Token': token}
+                params.append(("token", token))
             return self.agent.http.put(
-                CB.bool(), '/v1/catalog/deregister', data=json.dumps(data))
+                CB.bool(),
+                '/v1/catalog/deregister',
+                data=json.dumps(data),
+                params=params
+            )
 
         def datacenters(self):
             """
@@ -1716,7 +1823,8 @@ class Consul(object):
                 lock_delay=15,
                 behavior='release',
                 ttl=None,
-                dc=None):
+                dc=None,
+                token=None):
             """
             Creates a new session. There is more documentation for sessions
             `here <https://consul.io/docs/internals/sessions.html>`_.
@@ -1747,12 +1855,16 @@ class Consul(object):
             By default the session will be created in the current datacenter
             but an optional *dc* can be provided.
 
+            *token* is an optional `ACL token`_ to apply to this request.
+
             Returns the string *session_id* for the session.
             """
             params = []
             dc = dc or self.agent.dc
             if dc:
                 params.append(('dc', dc))
+            if token:
+                params.append(('token', token))
             data = {}
             if name:
                 data['name'] = name
@@ -1780,9 +1892,11 @@ class Consul(object):
                 params=params,
                 data=data)
 
-        def destroy(self, session_id, dc=None):
+        def destroy(self, session_id, dc=None, token=None):
             """
             Destroys the session *session_id*
+
+            *token* is an optional `ACL token`_ to apply to this request.
 
             Returns *True* on success.
             """
@@ -1790,12 +1904,20 @@ class Consul(object):
             dc = dc or self.agent.dc
             if dc:
                 params.append(('dc', dc))
+            if token:
+                params.append(('token', token))
             return self.agent.http.put(
                 CB.bool(),
                 '/v1/session/destroy/%s' % session_id,
                 params=params)
 
-        def list(self, index=None, wait=None, consistency=None, dc=None):
+        def list(
+                self,
+                index=None,
+                wait=None,
+                consistency=None,
+                dc=None,
+                token=None):
             """
             Returns a tuple of (*index*, *sessions*) of all active sessions in
             the *dc* datacenter. *dc* defaults to the current datacenter of
@@ -1811,6 +1933,8 @@ class Consul(object):
             *consistency* can be either 'default', 'consistent' or 'stale'. if
             not specified *consistency* will the consistency level this client
             was configured with.
+
+            *token* is an optional `ACL token`_ to apply to this request.
 
             The response looks like this::
 
@@ -1831,6 +1955,8 @@ class Consul(object):
             dc = dc or self.agent.dc
             if dc:
                 params.append(('dc', dc))
+            if token:
+                params.append(('token', token))
             if index:
                 params.append(('index', index))
                 if wait:
@@ -1841,7 +1967,14 @@ class Consul(object):
             return self.agent.http.get(
                 CB.json(index=True), '/v1/session/list', params=params)
 
-        def node(self, node, index=None, wait=None, consistency=None, dc=None):
+        def node(
+                self,
+                node,
+                index=None,
+                wait=None,
+                consistency=None,
+                dc=None,
+                token=None):
             """
             Returns a tuple of (*index*, *sessions*) as per *session.list*, but
             filters the sessions returned to only those active for *node*.
@@ -1856,11 +1989,15 @@ class Consul(object):
             *consistency* can be either 'default', 'consistent' or 'stale'. if
             not specified *consistency* will the consistency level this client
             was configured with.
+
+            *token* is an optional `ACL token`_ to apply to this request.
             """
             params = []
             dc = dc or self.agent.dc
             if dc:
                 params.append(('dc', dc))
+            if token:
+                params.append(('token', token))
             if index:
                 params.append(('index', index))
                 if wait:
@@ -1877,7 +2014,8 @@ class Consul(object):
                  index=None,
                  wait=None,
                  consistency=None,
-                 dc=None):
+                 dc=None,
+                 token=None):
             """
             Returns a tuple of (*index*, *session*) for the session
             *session_id* in the *dc* datacenter. *dc* defaults to the current
@@ -1893,11 +2031,15 @@ class Consul(object):
             *consistency* can be either 'default', 'consistent' or 'stale'. if
             not specified *consistency* will the consistency level this client
             was configured with.
+
+            *token* is an optional `ACL token`_ to apply to this request.
             """
             params = []
             dc = dc or self.agent.dc
             if dc:
                 params.append(('dc', dc))
+            if token:
+                params.append(('token', token))
             if index:
                 params.append(('index', index))
                 if wait:
@@ -1910,7 +2052,7 @@ class Consul(object):
                 '/v1/session/info/%s' % session_id,
                 params=params)
 
-        def renew(self, session_id, dc=None):
+        def renew(self, session_id, dc=None, token=None):
             """
             This is used with sessions that have a TTL, and it extends the
             expiration by the TTL.
@@ -1918,12 +2060,16 @@ class Consul(object):
             *dc* is the optional datacenter that you wish to communicate with.
             If None is provided, defaults to the agent's datacenter.
 
+            *token* is an optional `ACL token`_ to apply to this request.
+
             Returns the session.
             """
             params = []
             dc = dc or self.agent.dc
             if dc:
                 params.append(('dc', dc))
+            if token:
+                params.append(('token', token))
             return self.agent.http.put(
                 CB.json(one=True, allow_404=False),
                 '/v1/session/renew/%s' % session_id,
@@ -1932,6 +2078,175 @@ class Consul(object):
     class ACL(object):
         def __init__(self, agent):
             self.agent = agent
+
+        def create_token(
+            self,
+            accessor_id=None,
+            secret_id=None,
+            description=None,
+            policies=None,
+            roles=None,
+            service_identities=None,
+            local=None,
+            expiration_time=None,
+            expiration_ttl=None
+        ):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/token', params=args_to_payload(locals()))
+
+        def read_token(self, accessor_id):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/token/{}'.format(accessor_id))
+
+        def read_self_token(self):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/token/self')
+
+        def update_token(
+            self,
+            accessor_id,
+            secret_id=None,
+            description=None,
+            policies=None,
+            roles=None,
+            service_identities=None,
+            local=None,
+            expiration_time=None,
+            expiration_ttl=None
+        ):
+            return self.agent.http.put(
+                CB.json(),
+                '/v1/acl/policies/{}'.format(accessor_id),
+                params=args_to_payload(locals())
+            )
+
+        def clone_token(self, accessor_id, description=None):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/token/{}/clone'.format(accessor_id),
+                params=[("description", description)] if description != "" else [])
+
+        def delete_token(self, accessor_id):
+            return self.agent.http.delete(
+                CB.json(), '/v1/acl/token/{}'.format(accessor_id))
+
+        def list_tokens(self):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/tokens')
+
+        def create_policy(self, name, description=None, rules=None, datacenters=None):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/policy', params=args_to_payload(locals()))
+
+        def read_policy(self, policy_id):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/policy/{}'.format(policy_id))
+
+        def update_policy(self, policy_id, name, description=None, rules=None, datacenters=None):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/policy/{}'.format(policy_id), args_to_payload(locals()))
+
+        def delete_policy(self, policy_id):
+            return self.agent.http.delete(
+                CB.json(), '/v1/acl/policy/{}'.format(policy_id))
+
+        def list_policies(self):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/policies')
+
+        def create_role(self, name, description=None, policies=None, service_identities=None):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/role', params=args_to_payload(locals()))
+
+        def read_role(self, role_id):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/role/{}'.format(role_id))
+
+        def read_role_by_name(self, role_name):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/role/name/{}'.format(role_name))
+
+        def update_role(
+            self,
+            role_id,
+            name,
+            description=None,
+            policies=None,
+            service_identities=None
+        ):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/role/{}'.format(role_id), args_to_payload(locals()))
+
+        def delete_role(self, role_id):
+            return self.agent.http.delete(
+                CB.json(), '/v1/acl/role/{}'.format(role_id))
+
+        def list_roles(self, policy_id=None):
+            return self.agent.http.get(
+                CB.json(),
+                '/v1/acl/roles',
+                params=[("policy_id", policy_id)] if policy_id != "" else []
+            )
+
+        def create_auth_method(self, auth_method_name, auth_method_type, config, description=None):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/auth-method', params=args_to_payload(locals()))
+
+        def read_auth_method(self, auth_method_name):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/auth-method/{}'.format(auth_method_name))
+
+        def update_auth_method(self, auth_method_name, auth_method_type, config, description=None):
+            return self.agent.http.put(
+                CB.json(),
+                '/v1/acl/auth-method/{}'.format(auth_method_name),
+                args_to_payload(locals())
+            )
+
+        def delete_auth_method(self, auth_method_name):
+            return self.agent.http.delete(
+                CB.json(), '/v1/acl/auth-method/{}'.format(auth_method_name))
+
+        def list_auth_methods(self):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/auth-methods')
+
+        def create_binding_rule(
+            self,
+            binding_rule,
+            bind_type,
+            bind_name,
+            description=None,
+            selector=None
+        ):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/binding-rule', params=args_to_payload(locals()))
+
+        def read_binding_rule(self, binding_rule_id):
+            return self.agent.http.put(
+                CB.json(), '/v1/acl/binding-rule/{}'.format(binding_rule_id))
+
+        def update_binding_rule(
+            self,
+            binding_rule_id,
+            auth_method,
+            bind_type,
+            bind_name,
+            description=None,
+            selector=None
+        ):
+            return self.agent.http.put(
+                CB.json(),
+                '/v1/acl/binding-rule/{}'.format(binding_rule_id),
+                args_to_payload(locals())
+            )
+
+        def delete_binding_rule(self, binding_rule_id):
+            return self.agent.http.delete(
+                CB.json(), '/v1/acl/binding-rule/{}'.format(binding_rule_id))
+
+        def list_binding_rules(self):
+            return self.agent.http.get(
+                CB.json(), '/v1/acl/binding-rules')
 
         def list(self, token=None):
             """
@@ -2111,6 +2426,7 @@ class Consul(object):
         The Status endpoints are used to get information about the status
          of the Consul cluster.
         """
+
         def __init__(self, agent):
             self.agent = agent
 
